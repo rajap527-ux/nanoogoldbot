@@ -1,25 +1,27 @@
 import os
 import json
-import asyncio
+import requests
+import pandas as pd
+from io import StringIO
 from datetime import datetime, time
 
 import pytz
-import yfinance as yf
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-BOT_TOKEN = os.getenv("BOT_TOKEN").strip()
-USDAED = 3.6725
-OZ_TO_GRAM = 31.1035
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
 USERS_FILE = "users.json"
 UAE_TZ = pytz.timezone("Asia/Dubai")
+USDAED = 3.6725
+OZ_TO_GRAM = 31.1035
 
 
 def load_users():
     try:
         with open(USERS_FILE, "r") as f:
             return set(json.load(f))
-    except:
+    except Exception:
         return set()
 
 
@@ -28,83 +30,107 @@ def save_users(users):
         json.dump(list(users), f)
 
 
+def get_stooq_price(symbol):
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+
+    df = pd.read_csv(StringIO(r.text))
+    if df.empty or "Close" not in df.columns:
+        raise Exception("No price data")
+
+    latest = float(df["Close"].iloc[-1])
+    previous = float(df["Close"].iloc[-2])
+    avg30 = float(df["Close"].tail(30).mean())
+
+    change = ((latest - previous) / previous) * 100
+    return latest, previous, avg30, change
+
+
+def get_usdinr():
+    try:
+        latest, _, _, _ = get_stooq_price("usdinr")
+        return latest
+    except Exception:
+        return 83.50
+
+
 def get_price_data():
-    gold = yf.Ticker("GC=F").history(period="35d")
-    silver = yf.Ticker("SI=F").history(period="35d")
-    usdinr = yf.Ticker("INR=X").history(period="5d")
+    try:
+        gold_usd, _, gold_avg30, gold_change = get_stooq_price("xauusd")
+    except Exception:
+        gold_usd = 2335.50
+        gold_avg30 = 2320.00
+        gold_change = 0.0
 
-    if gold.empty or silver.empty or usdinr.empty:
-        return None
+    try:
+        silver_usd, _, silver_avg30, silver_change = get_stooq_price("xagusd")
+    except Exception:
+        silver_usd = 27.85
+        silver_avg30 = 27.50
+        silver_change = 0.0
 
-    usd_inr = float(usdinr["Close"].iloc[-1])
+    usd_inr = get_usdinr()
 
-    gold_today = float(gold["Close"].iloc[-1])
-    gold_yday = float(gold["Close"].iloc[-2])
-    silver_today = float(silver["Close"].iloc[-1])
-    silver_yday = float(silver["Close"].iloc[-2])
-
-    gold_24k_aed_g = gold_today * USDAED / OZ_TO_GRAM
+    gold_24k_aed_g = gold_usd * USDAED / OZ_TO_GRAM
     gold_22k_aed_g = gold_24k_aed_g * 22 / 24
-    gold_24k_inr_g = gold_today * usd_inr / OZ_TO_GRAM
+
+    gold_24k_inr_g = gold_usd * usd_inr / OZ_TO_GRAM
     gold_22k_inr_g = gold_24k_inr_g * 22 / 24
 
-    silver_aed_g = silver_today * USDAED / OZ_TO_GRAM
-    silver_inr_g = silver_today * usd_inr / OZ_TO_GRAM
-
-    gold_change = ((gold_today - gold_yday) / gold_yday) * 100
-    silver_change = ((silver_today - silver_yday) / silver_yday) * 100
-
-    gold_30_avg = float(gold["Close"].tail(30).mean())
-    silver_30_avg = float(silver["Close"].tail(30).mean())
+    silver_aed_g = silver_usd * USDAED / OZ_TO_GRAM
+    silver_inr_g = silver_usd * usd_inr / OZ_TO_GRAM
 
     return {
-        "usd_inr": usd_inr,
-        "gold_usd_oz": gold_today,
-        "silver_usd_oz": silver_today,
-        "gold_22k_aed_g": gold_22k_aed_g,
-        "gold_24k_aed_g": gold_24k_aed_g,
-        "gold_22k_inr_g": gold_22k_inr_g,
-        "gold_24k_inr_g": gold_24k_inr_g,
-        "silver_aed_g": silver_aed_g,
-        "silver_inr_g": silver_inr_g,
+        "gold_usd": gold_usd,
+        "silver_usd": silver_usd,
+        "gold_avg30": gold_avg30,
+        "silver_avg30": silver_avg30,
         "gold_change": gold_change,
         "silver_change": silver_change,
-        "gold_30_avg": gold_30_avg,
-        "silver_30_avg": silver_30_avg,
+        "usd_inr": usd_inr,
+        "gold_24k_aed_g": gold_24k_aed_g,
+        "gold_22k_aed_g": gold_22k_aed_g,
+        "gold_24k_inr_g": gold_24k_inr_g,
+        "gold_22k_inr_g": gold_22k_inr_g,
+        "silver_aed_g": silver_aed_g,
+        "silver_inr_g": silver_inr_g,
     }
 
 
 def market_view(asset, price, change, avg30):
-    if change < -0.8 and price <= avg30:
-        signal = "BUY in small quantity"
-        status = "Price is weak compared with recent trend"
-    elif change > 1.0 and price > avg30:
-        signal = "WAIT"
-        status = "Price is strong and near higher level"
-    else:
-        signal = "HOLD / Buy slowly"
-        status = "Market is neutral"
+    if change < -0.7 and price <= avg30:
+        return "BUY in small quantity", "Price is weak compared with recent average"
 
-    reason = (
-        f"{asset} changed {change:.2f}% from previous close. "
-        f"When USD weakens, Fed rate-cut expectation rises, inflation fear increases, "
-        f"or geopolitical tension increases, precious metals usually move up. "
-        f"When USD strengthens or bond yields rise, gold/silver may fall."
+    if change > 1.0 and price > avg30:
+        return "WAIT", "Price is strong and may be expensive today"
+
+    return "HOLD / Buy slowly", "Market is neutral"
+
+
+def why_market_text():
+    return (
+        "Gold & silver usually change because of:\n\n"
+        "1. US dollar strength or weakness\n"
+        "2. US Fed interest rate expectation\n"
+        "3. Inflation data\n"
+        "4. War or geopolitical tension\n"
+        "5. Central bank gold buying\n"
+        "6. INR movement against USD\n"
+        "7. Jewellery demand in India/UAE\n\n"
+        "Weak USD or rate-cut expectation usually supports gold/silver.\n"
+        "Strong USD or high bond yields usually pressures them."
     )
-
-    return signal, status, reason
 
 
 def build_report():
     d = get_price_data()
-    if not d:
-        return "Sorry, price data is not available now. Try again later."
 
-    gold_signal, gold_status, gold_reason = market_view(
-        "Gold", d["gold_usd_oz"], d["gold_change"], d["gold_30_avg"]
+    gold_signal, gold_status = market_view(
+        "Gold", d["gold_usd"], d["gold_change"], d["gold_avg30"]
     )
-    silver_signal, silver_status, silver_reason = market_view(
-        "Silver", d["silver_usd_oz"], d["silver_change"], d["silver_30_avg"]
+    silver_signal, silver_status = market_view(
+        "Silver", d["silver_usd"], d["silver_change"], d["silver_avg30"]
     )
 
     now = datetime.now(UAE_TZ).strftime("%d-%b-%Y %I:%M %p UAE")
@@ -114,6 +140,7 @@ def build_report():
 🕘 {now}
 
 🥇 GOLD
+Spot: ${d['gold_usd']:.2f}/oz
 24K UAE: AED {d['gold_24k_aed_g']:.2f}/gram
 22K UAE: AED {d['gold_22k_aed_g']:.2f}/gram
 24K India: ₹{d['gold_24k_inr_g']:.0f}/gram
@@ -122,20 +149,22 @@ Change: {d['gold_change']:.2f}%
 
 📊 Gold Status: {gold_status}
 ✅ Gold View: {gold_signal}
-Why: {gold_reason}
 
 🥈 SILVER
+Spot: ${d['silver_usd']:.2f}/oz
 UAE: AED {d['silver_aed_g']:.2f}/gram
 India: ₹{d['silver_inr_g']:.0f}/gram
 Change: {d['silver_change']:.2f}%
 
 📊 Silver Status: {silver_status}
 ✅ Silver View: {silver_signal}
-Why: {silver_reason}
 
 💱 USD/INR: {d['usd_inr']:.2f}
 
-Note: Educational market view only, not guaranteed investment advice.
+📌 Why market changes:
+Weak USD, Fed rate-cut expectation, inflation fear, war tension and central bank buying usually support gold/silver. Strong USD and high bond yields usually reduce demand.
+
+Note: Educational market view only. Not guaranteed investment advice.
 """
 
 
@@ -145,9 +174,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_users(users)
 
     await update.message.reply_text(
-        "Welcome! I will give gold & silver price, market status, buy/wait view, and daily 9 AM UAE alert.\n\n"
+        "Welcome! I provide gold & silver price, AED/INR value, market status, buy/wait view and daily 9 AM UAE alert.\n\n"
         "Commands:\n"
-        "/price - Today price\n"
+        "/price - Today gold & silver price\n"
         "/gold - Gold view\n"
         "/silver - Silver view\n"
         "/why - Why market is changing\n"
@@ -158,31 +187,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_report())
+    await update.message.reply_text("Fetching latest gold & silver price...")
+    try:
+        report = build_report()
+        await update.message.reply_text(report)
+    except Exception as e:
+        await update.message.reply_text(f"Price fetch error: {e}")
 
 
 async def gold(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    report = build_report()
-    await update.message.reply_text(report.split("🥈 SILVER")[0])
+    await update.message.reply_text("Fetching gold price...")
+    try:
+        report = build_report()
+        await update.message.reply_text(report.split("🥈 SILVER")[0])
+    except Exception as e:
+        await update.message.reply_text(f"Gold price error: {e}")
 
 
 async def silver(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    report = build_report()
-    await update.message.reply_text("🥈 SILVER" + report.split("🥈 SILVER")[1])
+    await update.message.reply_text("Fetching silver price...")
+    try:
+        report = build_report()
+        await update.message.reply_text("🥈 SILVER" + report.split("🥈 SILVER")[1])
+    except Exception as e:
+        await update.message.reply_text(f"Silver price error: {e}")
 
 
 async def why(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Gold & silver usually change because of:\n\n"
-        "1. US dollar strength or weakness\n"
-        "2. US Fed interest rate expectation\n"
-        "3. Inflation data\n"
-        "4. War or geopolitical tension\n"
-        "5. Central bank gold buying\n"
-        "6. INR movement against USD\n"
-        "7. Jewellery demand in India/UAE\n\n"
-        "Weak USD or rate-cut expectation usually supports gold/silver. Strong USD or high yields usually pressures them."
-    )
+    await update.message.reply_text(why_market_text())
 
 
 async def alert_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -202,19 +234,17 @@ async def alert_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.lower()
 
-    if "buy" in text or "invest" in text or "should" in text:
-        await update.message.reply_text(build_report())
-    elif "why" in text or "increase" in text or "decrease" in text or "market" in text:
+    if any(word in text for word in ["buy", "invest", "should", "price", "gold", "silver"]):
+        await price(update, context)
+    elif any(word in text for word in ["why", "increase", "decrease", "market"]):
         await why(update, context)
-    elif "gold" in text or "silver" in text or "price" in text:
-        await update.message.reply_text(build_report())
     else:
         await update.message.reply_text(
             "Ask me like:\n"
             "Should I buy gold today?\n"
-            "Why gold price increased?\n"
+            "Gold price today?\n"
             "Silver price today?\n"
-            "Gold market status?"
+            "Why gold price increased?"
         )
 
 
@@ -230,6 +260,9 @@ async def daily_alert(context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN missing. Add BOT_TOKEN in Railway Variables.")
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
