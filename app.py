@@ -8,7 +8,7 @@ import yfinance as yf
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN").strip()
 USDAED = 3.6725
 OZ_TO_GRAM = 31.1035
 USERS_FILE = "users.json"
