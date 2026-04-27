@@ -14,9 +14,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 USERS_FILE = "users.json"
 UAE_TZ = pytz.timezone("Asia/Dubai")
 
-USDAED = 3.6725
-OZ_TO_GRAM = 31.1035
-
 
 def load_users():
     try:
@@ -31,6 +28,14 @@ def save_users(users):
         json.dump(list(users), f)
 
 
+def money_to_int(text):
+    text = text.replace("₹", "").replace(",", "").strip()
+    text = re.sub(r"[^\d.]", "", text)
+    if not text:
+        return None
+    return int(float(text))
+
+
 def get_chennai_gold_silver_rate():
     url = "https://www.livechennai.com/gold_silverrate.asp"
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -40,96 +45,60 @@ def get_chennai_gold_silver_rate():
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    rows = soup.find_all("tr")
-
     gold_24k_1g = None
     gold_22k_1g = None
     silver_1g = None
 
-    for row in rows:
-        cols = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
-        clean = [re.sub(r"[₹,\s]", "", c) for c in cols]
+    for table in soup.find_all("table"):
+        table_text = table.get_text(" ", strip=True)
 
-        # Gold table row usually has: Date, 24K 1gm, 24K 8gm, 22K 1gm, 22K 8gm
-        if len(clean) >= 5 and re.search(r"\d{1,2}/[A-Za-z]{3}/\d{4}", cols[0]):
-            nums = []
-            for c in clean[1:]:
-                if c.isdigit():
-                    nums.append(int(c))
-
-            if len(nums) >= 4:
-                gold_24k_1g = nums[0]
-                gold_22k_1g = nums[2]
-                break
-
-    # Silver rate: find first row with date and silver-like smaller value
-    for row in rows:
-        cols = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
-        clean = [re.sub(r"[₹,\s]", "", c) for c in cols]
-
-        if len(clean) >= 2 and re.search(r"\d{1,2}/[A-Za-z]{3}/\d{4}", cols[0]):
-            nums = []
-            for c in clean[1:]:
-                if c.isdigit():
-                    nums.append(int(c))
-
-            # Silver 1gm is usually below 1000, gold is above 10000
-            for n in nums:
-                if 50 <= n <= 1000:
-                    silver_1g = n
+        if "Pure Gold" in table_text and "Standard Gold" in table_text:
+            for row in table.find_all("tr"):
+                cols = [c.get_text(" ", strip=True) for c in row.find_all("td")]
+                if len(cols) >= 5 and re.search(r"\d{1,2}/[A-Za-z]{3}/\d{4}", cols[0]):
+                    gold_24k_1g = money_to_int(cols[1])
+                    gold_22k_1g = money_to_int(cols[3])
                     break
 
-        if silver_1g:
-            break
+        if "Silver 1 Gm" in table_text and "Ready Silver" in table_text:
+            for row in table.find_all("tr"):
+                cols = [c.get_text(" ", strip=True) for c in row.find_all("td")]
+                if len(cols) >= 3 and re.search(r"\d{1,2}/[A-Za-z]{3}/\d{4}", cols[0]):
+                    silver_1g = money_to_int(cols[1])
+                    break
 
     if not gold_24k_1g or not gold_22k_1g:
-        raise Exception("Could not read today's live gold rate from LiveChennai")
+        raise Exception("Could not read Live Chennai gold table")
 
     if not silver_1g:
-        silver_1g = 270
+        raise Exception("Could not read Live Chennai silver table")
 
     return gold_24k_1g, gold_22k_1g, silver_1g
 
 
-def get_uae_gold_rate_from_india(gold_24k_inr):
-    """
-    Approx AED/gm conversion from India retail rate.
-    For exact UAE jewellery shop rate, separate UAE retail source is needed.
-    """
-    return gold_24k_inr / 22.7
+def get_aed_inr_rate():
+    try:
+        url = "https://api.frankfurter.app/latest?from=AED&to=INR"
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        return float(r.json()["rates"]["INR"])
+    except Exception:
+        return 22.70
 
 
 def get_price_data():
-    try:
-        gold_24k_inr_g, gold_22k_inr_g, silver_inr_g = get_chennai_gold_silver_rate()
-    except Exception:
-        gold_24k_inr_g = 15524
-        gold_22k_inr_g = 14230
-        silver_inr_g = 270
-
-    gold_24k_aed_g = get_uae_gold_rate_from_india(gold_24k_inr_g)
-    gold_22k_aed_g = get_uae_gold_rate_from_india(gold_22k_inr_g)
-    silver_aed_g = silver_inr_g / 22.7
+    gold_24k_inr_g, gold_22k_inr_g, silver_inr_g = get_chennai_gold_silver_rate()
+    aed_inr = get_aed_inr_rate()
 
     return {
         "gold_24k_inr_g": gold_24k_inr_g,
         "gold_22k_inr_g": gold_22k_inr_g,
         "silver_inr_g": silver_inr_g,
-        "gold_24k_aed_g": gold_24k_aed_g,
-        "gold_22k_aed_g": gold_22k_aed_g,
-        "silver_aed_g": silver_aed_g,
-        "gold_change": 0.0,
-        "silver_change": 0.0,
+        "gold_24k_aed_g": gold_24k_inr_g / aed_inr,
+        "gold_22k_aed_g": gold_22k_inr_g / aed_inr,
+        "silver_aed_g": silver_inr_g / aed_inr,
+        "aed_inr": aed_inr,
     }
-
-
-def market_view(asset, change):
-    if change < -0.7:
-        return "BUY in small quantity", "Price is lower today"
-    elif change > 1.0:
-        return "WAIT", "Price is higher today"
-    else:
-        return "HOLD / Buy slowly", "Market is neutral"
 
 
 def why_market_text():
@@ -142,45 +111,40 @@ def why_market_text():
         "5. Central bank gold buying\n"
         "6. INR movement against USD\n"
         "7. Jewellery demand in India/UAE\n\n"
-        "Weak USD or rate-cut expectation usually supports gold/silver.\n"
+        "Weak USD or rate-cut expectation usually supports gold/silver. "
         "Strong USD or high bond yields usually pressures them."
     )
 
 
 def build_report():
     d = get_price_data()
-
-    gold_signal, gold_status = market_view("Gold", d["gold_change"])
-    silver_signal, silver_status = market_view("Silver", d["silver_change"])
-
     now = datetime.now(UAE_TZ).strftime("%d-%b-%Y %I:%M %p UAE")
 
     return f"""
 🌅 Gold & Silver Market Update
 🕘 {now}
 
-🥇 GOLD - Chennai Retail Rate
+🥇 GOLD - Chennai Live Retail Rate
 24K India: ₹{d['gold_24k_inr_g']:,}/gram
 22K India: ₹{d['gold_22k_inr_g']:,}/gram
 
-Approx UAE Conversion:
-24K UAE: AED {d['gold_24k_aed_g']:.2f}/gram
-22K UAE: AED {d['gold_22k_aed_g']:.2f}/gram
+Approx AED Conversion:
+24K: AED {d['gold_24k_aed_g']:.2f}/gram
+22K: AED {d['gold_22k_aed_g']:.2f}/gram
 
-📊 Gold Status: {gold_status}
-✅ Gold View: {gold_signal}
-
-🥈 SILVER - Chennai Retail Rate
+🥈 SILVER - Chennai Live Retail Rate
 India: ₹{d['silver_inr_g']:,}/gram
-Approx UAE: AED {d['silver_aed_g']:.2f}/gram
+Approx AED: AED {d['silver_aed_g']:.2f}/gram
 
-📊 Silver Status: {silver_status}
-✅ Silver View: {silver_signal}
+💱 AED/INR: {d['aed_inr']:.2f}
+
+📊 Market Status: Neutral
+✅ View: HOLD / Buy slowly
 
 📌 Why market changes:
 {why_market_text()}
 
-Note: India rates are Chennai retail rates. UAE values are approximate conversion only.
+Note: India rates are from Live Chennai retail table. AED values are approximate currency conversion only.
 """
 
 
@@ -190,7 +154,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_users(users)
 
     await update.message.reply_text(
-        "Welcome! I provide gold & silver price, Chennai India rate, approximate AED value, market status and daily 9 AM UAE alert.\n\n"
+        "Welcome! I provide live Chennai gold & silver retail price, approximate AED value, market status and daily 9 AM UAE alert.\n\n"
         "Commands:\n"
         "/price - Today gold & silver price\n"
         "/gold - Gold view\n"
@@ -265,7 +229,10 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def daily_alert(context: ContextTypes.DEFAULT_TYPE):
     users = load_users()
-    report = build_report()
+    try:
+        report = build_report()
+    except Exception as e:
+        report = f"Daily price fetch error: {e}"
 
     for chat_id in users:
         try:
