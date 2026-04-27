@@ -32,11 +32,6 @@ def save_users(users):
 
 
 def get_chennai_gold_silver_rate():
-    """
-    Gets Chennai retail gold/silver rate from livechennai.com.
-    Expected table:
-    24K 1gm, 24K 8gm, 22K 1gm, 22K 8gm
-    """
     url = "https://www.livechennai.com/gold_silverrate.asp"
     headers = {"User-Agent": "Mozilla/5.0"}
 
@@ -44,24 +39,54 @@ def get_chennai_gold_silver_rate():
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
-    text = soup.get_text(" ", strip=True)
 
-    values = re.findall(r"₹\s*([0-9,]+)", text)
-    nums = [int(v.replace(",", "")) for v in values]
+    rows = soup.find_all("tr")
 
-    if len(nums) < 4:
-        raise Exception("Could not read Live Chennai gold rate")
+    gold_24k_1g = None
+    gold_22k_1g = None
+    silver_1g = None
 
-    # Based on Live Chennai table order
-    gold_24k_1g = nums[0]
-    gold_22k_1g = nums[2]
+    for row in rows:
+        cols = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
+        clean = [re.sub(r"[₹,\s]", "", c) for c in cols]
 
-    # Silver rate: try to find latest visible silver 1gm rate
-    silver_matches = re.findall(r"Silver.*?₹\s*([0-9,]+)", text, re.IGNORECASE)
-    if silver_matches:
-        silver_1g = int(silver_matches[0].replace(",", ""))
-    else:
-        silver_1g = 270  # fallback from your screenshot
+        # Gold table row usually has: Date, 24K 1gm, 24K 8gm, 22K 1gm, 22K 8gm
+        if len(clean) >= 5 and re.search(r"\d{1,2}/[A-Za-z]{3}/\d{4}", cols[0]):
+            nums = []
+            for c in clean[1:]:
+                if c.isdigit():
+                    nums.append(int(c))
+
+            if len(nums) >= 4:
+                gold_24k_1g = nums[0]
+                gold_22k_1g = nums[2]
+                break
+
+    # Silver rate: find first row with date and silver-like smaller value
+    for row in rows:
+        cols = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
+        clean = [re.sub(r"[₹,\s]", "", c) for c in cols]
+
+        if len(clean) >= 2 and re.search(r"\d{1,2}/[A-Za-z]{3}/\d{4}", cols[0]):
+            nums = []
+            for c in clean[1:]:
+                if c.isdigit():
+                    nums.append(int(c))
+
+            # Silver 1gm is usually below 1000, gold is above 10000
+            for n in nums:
+                if 50 <= n <= 1000:
+                    silver_1g = n
+                    break
+
+        if silver_1g:
+            break
+
+    if not gold_24k_1g or not gold_22k_1g:
+        raise Exception("Could not read today's live gold rate from LiveChennai")
+
+    if not silver_1g:
+        silver_1g = 270
 
     return gold_24k_1g, gold_22k_1g, silver_1g
 
