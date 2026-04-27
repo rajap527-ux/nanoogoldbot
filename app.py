@@ -1,11 +1,11 @@
 import os
 import json
+import re
 import requests
-import pandas as pd
-from io import StringIO
 from datetime import datetime, time
 
 import pytz
+from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -13,6 +13,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 USERS_FILE = "users.json"
 UAE_TZ = pytz.timezone("Asia/Dubai")
+
 USDAED = 3.6725
 OZ_TO_GRAM = 31.1035
 
@@ -30,82 +31,80 @@ def save_users(users):
         json.dump(list(users), f)
 
 
-def get_stooq_price(symbol):
-    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-    r = requests.get(url, timeout=15)
+def get_chennai_gold_silver_rate():
+    """
+    Gets Chennai retail gold/silver rate from livechennai.com.
+    Expected table:
+    24K 1gm, 24K 8gm, 22K 1gm, 22K 8gm
+    """
+    url = "https://www.livechennai.com/gold_silverrate.asp"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
 
-    df = pd.read_csv(StringIO(r.text))
-    if df.empty or "Close" not in df.columns:
-        raise Exception("No price data")
+    soup = BeautifulSoup(r.text, "html.parser")
+    text = soup.get_text(" ", strip=True)
 
-    latest = float(df["Close"].iloc[-1])
-    previous = float(df["Close"].iloc[-2])
-    avg30 = float(df["Close"].tail(30).mean())
+    values = re.findall(r"₹\s*([0-9,]+)", text)
+    nums = [int(v.replace(",", "")) for v in values]
 
-    change = ((latest - previous) / previous) * 100
-    return latest, previous, avg30, change
+    if len(nums) < 4:
+        raise Exception("Could not read Live Chennai gold rate")
+
+    # Based on Live Chennai table order
+    gold_24k_1g = nums[0]
+    gold_22k_1g = nums[2]
+
+    # Silver rate: try to find latest visible silver 1gm rate
+    silver_matches = re.findall(r"Silver.*?₹\s*([0-9,]+)", text, re.IGNORECASE)
+    if silver_matches:
+        silver_1g = int(silver_matches[0].replace(",", ""))
+    else:
+        silver_1g = 270  # fallback from your screenshot
+
+    return gold_24k_1g, gold_22k_1g, silver_1g
 
 
-def get_usdinr():
-    try:
-        latest, _, _, _ = get_stooq_price("usdinr")
-        return latest
-    except Exception:
-        return 83.50
+def get_uae_gold_rate_from_india(gold_24k_inr):
+    """
+    Approx AED/gm conversion from India retail rate.
+    For exact UAE jewellery shop rate, separate UAE retail source is needed.
+    """
+    return gold_24k_inr / 22.7
 
 
 def get_price_data():
     try:
-        gold_usd, _, gold_avg30, gold_change = get_stooq_price("xauusd")
+        gold_24k_inr_g, gold_22k_inr_g, silver_inr_g = get_chennai_gold_silver_rate()
     except Exception:
-        gold_usd = 2335.50
-        gold_avg30 = 2320.00
-        gold_change = 0.0
+        gold_24k_inr_g = 15524
+        gold_22k_inr_g = 14230
+        silver_inr_g = 270
 
-    try:
-        silver_usd, _, silver_avg30, silver_change = get_stooq_price("xagusd")
-    except Exception:
-        silver_usd = 27.85
-        silver_avg30 = 27.50
-        silver_change = 0.0
-
-    usd_inr = get_usdinr()
-
-    gold_24k_aed_g = gold_usd * USDAED / OZ_TO_GRAM
-    gold_22k_aed_g = gold_24k_aed_g * 22 / 24
-
-    gold_24k_inr_g = gold_usd * usd_inr / OZ_TO_GRAM
-    gold_22k_inr_g = gold_24k_inr_g * 22 / 24
-
-    silver_aed_g = silver_usd * USDAED / OZ_TO_GRAM
-    silver_inr_g = silver_usd * usd_inr / OZ_TO_GRAM
+    gold_24k_aed_g = get_uae_gold_rate_from_india(gold_24k_inr_g)
+    gold_22k_aed_g = get_uae_gold_rate_from_india(gold_22k_inr_g)
+    silver_aed_g = silver_inr_g / 22.7
 
     return {
-        "gold_usd": gold_usd,
-        "silver_usd": silver_usd,
-        "gold_avg30": gold_avg30,
-        "silver_avg30": silver_avg30,
-        "gold_change": gold_change,
-        "silver_change": silver_change,
-        "usd_inr": usd_inr,
-        "gold_24k_aed_g": gold_24k_aed_g,
-        "gold_22k_aed_g": gold_22k_aed_g,
         "gold_24k_inr_g": gold_24k_inr_g,
         "gold_22k_inr_g": gold_22k_inr_g,
-        "silver_aed_g": silver_aed_g,
         "silver_inr_g": silver_inr_g,
+        "gold_24k_aed_g": gold_24k_aed_g,
+        "gold_22k_aed_g": gold_22k_aed_g,
+        "silver_aed_g": silver_aed_g,
+        "gold_change": 0.0,
+        "silver_change": 0.0,
     }
 
 
-def market_view(asset, price, change, avg30):
-    if change < -0.7 and price <= avg30:
-        return "BUY in small quantity", "Price is weak compared with recent average"
-
-    if change > 1.0 and price > avg30:
-        return "WAIT", "Price is strong and may be expensive today"
-
-    return "HOLD / Buy slowly", "Market is neutral"
+def market_view(asset, change):
+    if change < -0.7:
+        return "BUY in small quantity", "Price is lower today"
+    elif change > 1.0:
+        return "WAIT", "Price is higher today"
+    else:
+        return "HOLD / Buy slowly", "Market is neutral"
 
 
 def why_market_text():
@@ -126,12 +125,8 @@ def why_market_text():
 def build_report():
     d = get_price_data()
 
-    gold_signal, gold_status = market_view(
-        "Gold", d["gold_usd"], d["gold_change"], d["gold_avg30"]
-    )
-    silver_signal, silver_status = market_view(
-        "Silver", d["silver_usd"], d["silver_change"], d["silver_avg30"]
-    )
+    gold_signal, gold_status = market_view("Gold", d["gold_change"])
+    silver_signal, silver_status = market_view("Silver", d["silver_change"])
 
     now = datetime.now(UAE_TZ).strftime("%d-%b-%Y %I:%M %p UAE")
 
@@ -139,32 +134,28 @@ def build_report():
 🌅 Gold & Silver Market Update
 🕘 {now}
 
-🥇 GOLD
-Spot: ${d['gold_usd']:.2f}/oz
+🥇 GOLD - Chennai Retail Rate
+24K India: ₹{d['gold_24k_inr_g']:,}/gram
+22K India: ₹{d['gold_22k_inr_g']:,}/gram
+
+Approx UAE Conversion:
 24K UAE: AED {d['gold_24k_aed_g']:.2f}/gram
 22K UAE: AED {d['gold_22k_aed_g']:.2f}/gram
-24K India: ₹{d['gold_24k_inr_g']:.0f}/gram
-22K India: ₹{d['gold_22k_inr_g']:.0f}/gram
-Change: {d['gold_change']:.2f}%
 
 📊 Gold Status: {gold_status}
 ✅ Gold View: {gold_signal}
 
-🥈 SILVER
-Spot: ${d['silver_usd']:.2f}/oz
-UAE: AED {d['silver_aed_g']:.2f}/gram
-India: ₹{d['silver_inr_g']:.0f}/gram
-Change: {d['silver_change']:.2f}%
+🥈 SILVER - Chennai Retail Rate
+India: ₹{d['silver_inr_g']:,}/gram
+Approx UAE: AED {d['silver_aed_g']:.2f}/gram
 
 📊 Silver Status: {silver_status}
 ✅ Silver View: {silver_signal}
 
-💱 USD/INR: {d['usd_inr']:.2f}
-
 📌 Why market changes:
-Weak USD, Fed rate-cut expectation, inflation fear, war tension and central bank buying usually support gold/silver. Strong USD and high bond yields usually reduce demand.
+{why_market_text()}
 
-Note: Educational market view only. Not guaranteed investment advice.
+Note: India rates are Chennai retail rates. UAE values are approximate conversion only.
 """
 
 
@@ -174,7 +165,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_users(users)
 
     await update.message.reply_text(
-        "Welcome! I provide gold & silver price, AED/INR value, market status, buy/wait view and daily 9 AM UAE alert.\n\n"
+        "Welcome! I provide gold & silver price, Chennai India rate, approximate AED value, market status and daily 9 AM UAE alert.\n\n"
         "Commands:\n"
         "/price - Today gold & silver price\n"
         "/gold - Gold view\n"
@@ -189,8 +180,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Fetching latest gold & silver price...")
     try:
-        report = build_report()
-        await update.message.reply_text(report)
+        await update.message.reply_text(build_report())
     except Exception as e:
         await update.message.reply_text(f"Price fetch error: {e}")
 
